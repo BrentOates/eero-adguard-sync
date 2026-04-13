@@ -1,4 +1,4 @@
-from abc import ABC, abstractmethod, abstractclassmethod
+from abc import ABC, abstractmethod
 from typing import Generic, TypeVar
 
 from .client_table import DHCPClient

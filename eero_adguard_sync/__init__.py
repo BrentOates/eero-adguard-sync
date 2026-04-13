@@ -1,7 +1,7 @@
-from pkg_resources import get_distribution, DistributionNotFound
+from importlib.metadata import version, PackageNotFoundError
 
 
 try:
-    VERSION = get_distribution("eero-adguard-sync").version
-except DistributionNotFound:
+    VERSION = version("eero-adguard-sync")
+except PackageNotFoundError:
     VERSION = "__missing__"

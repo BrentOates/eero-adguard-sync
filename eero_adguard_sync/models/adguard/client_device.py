@@ -52,11 +52,16 @@ class AdGuardClientDevice(DHCPClientDevice):
         return ''
 
     @classmethod
-    def from_dhcp_client(cls, dhcp_client: "DHCPClient") -> "AdGuardClientDevice":
+    def from_dhcp_client(
+        cls, dhcp_client: "DHCPClient", exclude_ids: set[str] = None
+    ) -> "AdGuardClientDevice":
         if isinstance(dhcp_client.instance, cls):
             return dhcp_client.instance
+        ids = dhcp_client.identifiers
+        if exclude_ids:
+            ids = ids - {i.lower() for i in exclude_ids}
         return cls(
-            ids=list(dhcp_client.identifiers),
+            ids=list(ids),
             name=dhcp_client.nickname,
             tags=dhcp_client.tags,
         )

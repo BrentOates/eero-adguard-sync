@@ -22,7 +22,9 @@ class AdGuardClient:
     ):
         if not server_ip.endswith("/"):
             server_ip += "/"
-        server_url = urlparse(server_ip, "http").geturl().replace("///", "//")
+        if "://" not in server_ip:
+            server_ip = "http://" + server_ip
+        server_url = urlparse(server_ip).geturl()
         self.session = BaseURLSession(server_url)
         self.__logged_in = False
         if auto_auth:

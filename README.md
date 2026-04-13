@@ -5,51 +5,64 @@ Sync Eero DHCP client list to AdGuard Home
 [![PyPI](https://img.shields.io/pypi/v/eero-adguard-sync?color=blue)](https://pypi.org/project/eero-adguard-sync/)
 [![Code style](https://img.shields.io/badge/code%20style-black-black)](https://github.com/psf/black)
 
-
 ![eero-adguard-sync](https://repository-images.githubusercontent.com/445873210/a0dcb692-fe53-4e6e-83a9-4507664080c1)
 
 Table of Contents
 =================
-* [Eero-Adguard-Sync](#eero-adguard-sync)
-   * [Dependencies](#-dependencies)
-   * [Installation](#️-installation)
-   * [Usage](#-usage)
-   * [Options](#️-options)
-      * [eag-sync](#eag-sync)
-      * [eag-sync sync](#eag-sync-sync)
-      * [eag-sync clear](#eag-sync-clear)
-   * [Autocompletion](#-autocompletion)
-      * [bash](#bash)
-      * [zsh](#zsh)
-   * [Docker](#-docker)
-   * [License](#️-license)
+* [Dependencies](#-dependencies)
+* [Installation](#️-installation)
+* [Usage](#-usage)
+* [Options](#️-options)
+  * [eag-sync](#eag-sync)
+  * [eag-sync sync](#eag-sync-sync)
+  * [eag-sync clear](#eag-sync-clear)
+* [Autocompletion](#-autocompletion)
+* [Docker](#-docker)
+* [License](#️-license)
 
 ## 👶 Dependencies
-* [Python 3.7 or higher](https://www.python.org/downloads/)
+* [Python 3.10 or higher](https://www.python.org/downloads/)
 
 ## 🛠️ Installation
-Install from PyPI using `pip`, you may need to use `pip3` depending on your installation:
+
+### From PyPI
 ```shell
 pip install eero-adguard-sync
 ```
 
-## 🚀 Usage
-**eag-sync** is a command-line program to sync your Eero DHCP client list to AdGuard Home, note that it is a one-way sync from Eero to AdGuard. It requires Python interpreter version 3.7+.
+### From source (local development)
+Clone the repo and install in editable mode so your changes are reflected immediately:
+```shell
+git clone https://github.com/amickael/eero-adguard-sync.git
+cd eero-adguard-sync
+pip install -e .
+```
 
-To run a sync process run the `eag-sync sync` command, you can find a full list of options below. Sample usage:
+This installs all dependencies from `requirements.txt` and registers the `eag-sync` command on your PATH. Any edits you make to the source files take effect without reinstalling.
+
+## 🚀 Usage
+**eag-sync** is a command-line program to sync your Eero DHCP client list to AdGuard Home. It is a one-way sync from Eero to AdGuard and requires Python 3.10+.
+
+Run a sync:
 ```shell
 eag-sync sync
 ```
 
-You may be prompted for an Eero email or SMS code the first time you run this program. Your credentials never leave your computer, all processing is done client side.
+You will be prompted for your Eero email and an SMS/email verification code on first run. Your credentials are cached locally — they never leave your computer.
 
-To clear all locally cached credentials run the `clear` command:
+To clear all locally cached credentials:
 ```shell
 eag-sync clear
 ```
 
+### Duplicate and rotating MAC handling
+
+When a device (e.g. an iPhone with Private Wi-Fi Address) rotates its MAC address, it retains its name in Eero. The sync detects this and **updates** the existing AdGuard client with the new MAC rather than deleting and recreating it, preserving any per-client rules you have configured.
+
+If two Eero devices share the same name (e.g. two devices both called "Living Room"), the conflicting name is automatically stripped from both clients' AdGuard identifiers so neither causes a rejection.
 
 ## ⚙️ Options
+
 ### `eag-sync`
 ```
 Usage: eag-sync [OPTIONS] COMMAND [ARGS]...
@@ -68,15 +81,56 @@ Commands:
 Usage: eag-sync sync [OPTIONS]
 
 Options:
-  --adguard-host TEXT      AdGuard Home host IP address
-  --adguard-user TEXT      AdGuard Home username
-  --adguard-password TEXT  AdGuard Home password
-  --eero-user TEXT         Eero email address or phone number
-  -d, --delete             Delete AdGuard clients not found in Eero DHCP list
-  -y, --confirm            Skip interactive confirmation
-  -o, --overwrite          Delete all AdGuard clients before sync
-  --help                   Show this message and exit.
+  --adguard-host TEXT     AdGuard Home host IP address  [env: EAG_ADGUARD_HOST]
+  --adguard-user TEXT     AdGuard Home username  [env: EAG_ADGUARD_USER]
+  --adguard-password TEXT AdGuard Home password  [env: EAG_ADGUARD_PASS]
+  --eero-user TEXT        Eero email address or phone number  [env: EAG_EERO_USER]
+  --eero-cookie TEXT      Eero session cookie  [env: EAG_EERO_COOKIE]
+  -d, --delete            Delete AdGuard clients not found in Eero DHCP list
+                          [env: EAG_DELETE]
+  -y, --confirm           Skip interactive confirmation  [env: EAG_CONFIRM]
+  -o, --overwrite         Delete all AdGuard clients before sync
+                          [env: EAG_OVERWRITE]
+  -x, --exclude-range TEXT
+                          CIDR range(s) protected from deletion when --delete
+                          is active (e.g. 192.168.1.0/24). Repeatable.
+                          Env var: comma-separated string.  [env: EAG_EXCLUDE_RANGE]
+  -e, --exclude-id TEXT   Client identifier(s) protected from deletion when
+                          --delete is active. Accepts MAC address, client name,
+                          or hostname. Supports wildcards (e.g. my-device*). Repeatable.
+                          Env var: comma-separated string.  [env: EAG_EXCLUDE_ID]
+  --debug                 Display debug information
+  --help                  Show this message and exit.
 ```
+
+#### Protecting clients from deletion
+
+When running with `--delete`, you can protect specific clients from being removed even if they are absent from the Eero DHCP list:
+
+```shell
+# Protect an entire subnet
+eag-sync sync --delete --exclude-range 192.168.1.0/24
+
+# Protect a specific device by MAC address
+eag-sync sync --delete --exclude-id "11:22:33:44:55:66"
+
+# Protect a device by its AdGuard client name
+eag-sync sync --delete --exclude-id "My Device"
+
+# Protect all devices whose name starts with a prefix (wildcard)
+eag-sync sync --delete --exclude-id "my-prefix*"
+
+# Combine multiple protections
+eag-sync sync --delete \
+  --exclude-range 192.168.2.0/24 \
+  --exclude-id "11:22:33:44:55:66" \
+  --exclude-id "my-server"
+```
+
+This is useful for:
+- Devices with custom AdGuard rules (blocked services, custom upstreams) that you don't want reset
+- Devices that are temporarily offline at sync time
+- Static IP devices outside the Eero DHCP range
 
 ### `eag-sync clear`
 ```
@@ -88,36 +142,84 @@ Options:
 ```
 
 ## 🔮 Autocompletion
-To enable tab completion you will need to configure your preferred shell to use it. Currently `bash` and `zsh` are supported.
-
-This configuration is totally optional, but may be useful if you use `eag-sync` often.
 
 ### bash
-Add the following to `~/.bashrc`:
+Add to `~/.bashrc`:
 ```shell
 eval "$(_EAG_SYNC_COMPLETE=bash_source eag-sync)"
 ```
 
 ### zsh
-Add the following to `~/.zshrc`:
+Add to `~/.zshrc`:
 ```shell
 eval "$(_EAG_SYNC_COMPLETE=zsh_source eag-sync)"
 ```
 
 ## 🐋 Docker
-A Docker image that executes `eag-sync sync` on a `cron` schedule is available on Docker Hub with the tag [`amickael/eero-adguard-sync`](https://hub.docker.com/repository/docker/amickael/eero-adguard-sync). Some environment variables are required when running a container, see the table below for details.
 
-You can also build the image locally using the `Dockerfile` located in `/docker`.
+A Docker image that executes `eag-sync sync` on a `cron` schedule is available on Docker Hub: [`amickael/eero-adguard-sync`](https://hub.docker.com/repository/docker/amickael/eero-adguard-sync).
 
-**Variable**|**Name**|**Notes**|**Required**|**Default**
------|-----|-----|-----|-----
-EAG\_EERO\_COOKIE|Eero session cookie value|Eero session cookie value from output of `eag-sync sync --debug`|Yes| 
-EAG\_ADGUARD\_HOST|AdGuard host IP address| |Yes| 
-EAG\_ADGUARD\_USER|AdGuard admin username| |Yes| 
-EAG\_ADGUARD\_PASS|AdGuard admin password| |Yes| 
-EAG\_SYNC\_FLAGS|`eag-sync` `sync` command flags|Sync flags without the dash, e.g. `EAG_SYNC_FLAGS="d"`<br><br>Note: `-y` is always appended|No|-y
-EAG\_CRON\_SCHEDULE|Sync schedule in cron syntax|See [crontab.guru](https://crontab.guru) for examples|No|`0 0 * * *`
+All configuration is passed via environment variables. Every CLI option has a corresponding env var — see the table below.
 
+| Variable | Description | Required | Default |
+|---|---|---|---|
+| `EAG_EERO_COOKIE` | Eero session cookie (from `eag-sync sync --debug`) | Yes | |
+| `EAG_ADGUARD_HOST` | AdGuard Home host IP address | Yes | |
+| `EAG_ADGUARD_USER` | AdGuard admin username | Yes | |
+| `EAG_ADGUARD_PASS` | AdGuard admin password | Yes | |
+| `EAG_DELETE` | Enable deletion of AdGuard clients not in Eero (`true`/`1`) | No | |
+| `EAG_OVERWRITE` | Wipe all AdGuard clients before sync (`true`/`1`) | No | |
+| `EAG_CONFIRM` | Skip interactive confirmation (`true`/`1`) | No | |
+| `EAG_EXCLUDE_RANGE` | Comma-separated CIDR ranges protected from deletion | No | |
+| `EAG_EXCLUDE_ID` | Comma-separated client identifiers (MAC, name, hostname) protected from deletion | No | |
+| `EAG_CRON_SCHEDULE` | Sync schedule in cron syntax | No | `0 0 * * *` |
+
+### Example `docker run`
+
+```shell
+docker run -d \
+  -e EAG_EERO_COOKIE="your-cookie" \
+  -e EAG_ADGUARD_HOST="192.168.1.1" \
+  -e EAG_ADGUARD_USER="admin" \
+  -e EAG_ADGUARD_PASS="password" \
+  -e EAG_DELETE="true" \
+  -e EAG_CONFIRM="true" \
+  -e EAG_EXCLUDE_RANGE="192.168.1.0/24" \
+  -e EAG_EXCLUDE_ID="11:22:33:44:55:66,my-server" \
+  -e EAG_CRON_SCHEDULE="0 * * * *" \
+  amickael/eero-adguard-sync
+```
+
+### Example `docker-compose.yml`
+
+```yaml
+services:
+  eero-adguard-sync:
+    image: amickael/eero-adguard-sync
+    environment:
+      EAG_EERO_COOKIE: "your-cookie"
+      EAG_ADGUARD_HOST: "192.168.1.1"
+      EAG_ADGUARD_USER: "admin"
+      EAG_ADGUARD_PASS: "password"
+      EAG_DELETE: "true"
+      EAG_CONFIRM: "true"
+      EAG_EXCLUDE_RANGE: "192.168.1.0/24"
+      EAG_EXCLUDE_ID: "11:22:33:44:55:66,my-server"
+      EAG_CRON_SCHEDULE: "0 * * * *"
+    restart: unless-stopped
+```
+
+## 🔄 Migration
+
+### `EAG_SYNC_FLAGS` (deprecated)
+
+Older deployments used `EAG_SYNC_FLAGS` to pass raw CLI flags to the sync script (e.g. `EAG_SYNC_FLAGS="-y -d"`). This is still supported for backwards compatibility, but is superseded by the individual env vars.
+
+| Old | New |
+|---|---|
+| `EAG_SYNC_FLAGS="-y"` | `EAG_CONFIRM=true` |
+| `EAG_SYNC_FLAGS="-d"` | `EAG_DELETE=true` |
+| `EAG_SYNC_FLAGS="-y -d"` | `EAG_CONFIRM=true` + `EAG_DELETE=true` |
 
 ## ⚖️ License
 [MIT © 2022 Andrew Mickael](https://github.com/amickael/eero-adguard-sync/blob/master/LICENSE)

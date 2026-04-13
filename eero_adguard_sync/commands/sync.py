@@ -1,3 +1,5 @@
+import ipaddress
+import fnmatch
 import click
 from requests import HTTPError
 from timeit import default_timer as timer
@@ -6,6 +8,7 @@ from eero_adguard_sync.client import EeroClient, AdGuardClient
 from eero_adguard_sync.models import (
     AdGuardCredentialSet,
     AdGuardClientDevice,
+    DHCPClient,
     DHCPClientTable,
     DHCPClientTableDiff,
 )
@@ -16,6 +19,14 @@ NETWORK_SELECT_PROMPT = """Multiple Eero networks found, please select by ID
 {network_options}
 
 Network ID"""
+
+
+def _parse_multi_env(value: tuple[str, ...]) -> tuple[str, ...]:
+    """Expand comma-separated values that arrive as a single env var string."""
+    result = []
+    for item in value:
+        result.extend(v.strip() for v in item.split(",") if v.strip())
+    return tuple(result)
 
 
 class EeroAdGuardSyncHandler:
@@ -39,80 +50,153 @@ class EeroAdGuardSyncHandler:
                 [f"{i}: {network['name']}" for i, network in enumerate(network_list)]
             )
             choice = click.Choice([str(i) for i in range(network_count)])
-            click.prompt(
-                NETWORK_SELECT_PROMPT.format(network_options=network_options),
-                type=choice,
-                default=str(network_idx),
-                show_choices=False,
+            network_idx = int(
+                click.prompt(
+                    NETWORK_SELECT_PROMPT.format(network_options=network_options),
+                    type=choice,
+                    default=str(network_idx),
+                    show_choices=False,
+                )
             )
         network = network_list[network_idx]
         click.echo(f"Selected network '{network['name']}'")
         return network["url"]
 
-    def create(self, diff: DHCPClientTableDiff):
+    def _is_excluded(
+        self,
+        device: DHCPClient,
+        exclude_ranges: list[ipaddress.IPv4Network | ipaddress.IPv6Network],
+        exclude_ids: set[str],
+    ) -> bool:
+        patterns = [i.lower() for i in exclude_ids]
+        candidates = [
+            str(device.mac_address).lower(),
+            device.nickname.lower(),
+            device.hostname.lower(),
+        ]
+        for candidate in candidates:
+            for pattern in patterns:
+                if fnmatch.fnmatch(candidate, pattern):
+                    return True
+        for iface in device.ip_interfaces:
+            for network in exclude_ranges:
+                if iface.ip in network:
+                    return True
+        return False
+
+    def create(
+        self,
+        diff: DHCPClientTableDiff,
+        conflicting_nicknames: set[str] = None,
+        claimed_ids: set[str] = None,
+    ):
         if not diff.discovered:
             click.echo("No new clients found, skipped creation")
             return
+        conflicting_nicknames = {n.lower() for n in (conflicting_nicknames or set())}
+        running_claimed = set(claimed_ids or set())
         with click.progressbar(
             diff.discovered, label="Add new clients", show_pos=True
         ) as bar:
-            duplicate_devices = []
             for eero_device in bar:
+                device = AdGuardClientDevice.from_dhcp_client(
+                    eero_device, exclude_ids=conflicting_nicknames | running_claimed
+                )
+                running_claimed.update(i.lower() for i in device.ids)
                 try:
-                    self.adguard_client.add_client_device(
-                        AdGuardClientDevice.from_dhcp_client(eero_device)
-                    )
+                    self.adguard_client.add_client_device(device)
                 except HTTPError as e:
                     errors = [
                         "client already exists",
                         "another client uses the same id",
                     ]
-                    if any(
-                        [
-                            True
-                            for error in errors
-                            if error.lower() in e.response.text.lower()
-                        ]
-                    ):
-                        duplicate_devices.append(
-                            f"'{eero_device.nickname}' [{eero_device.mac_address}]"
+                    if any(error.lower() in e.response.text.lower() for error in errors):
+                        click.secho(
+                            f"Warning: skipped '{eero_device.nickname}' [{eero_device.mac_address}]"
+                            f" — identifier conflict with existing AdGuard client",
+                            fg="yellow",
                         )
                     else:
                         raise
-            if duplicate_devices:
-                for duplicate_device in duplicate_devices:
-                    click.secho(
-                        f"Skipped device, duplicate name in Eero network: {duplicate_device}",
-                        fg="red",
-                    )
 
-    def update(self, diff: DHCPClientTableDiff):
+    def update(self, diff: DHCPClientTableDiff, conflicting_nicknames: set[str] = None):
         if not diff.associated:
             click.echo("No existing clients found, skipped update")
             return
+        conflicting_nicknames = {n.lower() for n in (conflicting_nicknames or set())}
         with click.progressbar(
             diff.associated, label="Update existing clients", show_pos=True
         ) as bar:
             for adguard_device, eero_device in bar:
-                new_device = AdGuardClientDevice.from_dhcp_client(eero_device)
-                new_device.params = adguard_device.instance.params
-                self.adguard_client.update_client_device(
-                    adguard_device.nickname, new_device
+                new_device = AdGuardClientDevice.from_dhcp_client(
+                    eero_device, exclude_ids=conflicting_nicknames
                 )
+                new_device.params = adguard_device.instance.params
+                try:
+                    self.adguard_client.update_client_device(
+                        adguard_device.nickname, new_device
+                    )
+                except HTTPError as e:
+                    click.secho(
+                        f"Warning: failed to update '{eero_device.nickname}' "
+                        f"[{eero_device.mac_address}]: {e.response.text}",
+                        fg="yellow",
+                    )
 
-    def delete(self, diff: DHCPClientTableDiff):
-        if not diff.missing:
+    def delete(
+        self,
+        diff: DHCPClientTableDiff,
+        exclude_ranges: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = None,
+        exclude_ids: set[str] = None,
+    ):
+        exclude_ranges = exclude_ranges or []
+        exclude_ids = exclude_ids or set()
+
+        candidates = []
+        for device in diff.missing:
+            if self._is_excluded(device, exclude_ranges, exclude_ids):
+                click.secho(
+                    f"Protected from deletion: '{device.nickname}' [{device.mac_address}]",
+                    fg="yellow",
+                )
+            else:
+                candidates.append(device)
+
+        if not candidates:
             click.echo("No removed clients found, skipped deletion")
             return
         with click.progressbar(
-            diff.missing, label="Delete removed clients", show_pos=True
+            candidates, label="Delete removed clients", show_pos=True
         ) as bar:
             for device in bar:
                 self.adguard_client.remove_client_device(device.nickname)
 
-    def sync(self, delete: bool = False, overwrite: bool = False):
+    def sync(
+        self,
+        delete: bool = False,
+        overwrite: bool = False,
+        exclude_ranges: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = None,
+        exclude_ids: set[str] = None,
+    ):  
+        exclude_ranges = exclude_ranges or []
+        exclude_ids = exclude_ids or set()
+
         if overwrite:
-            self.adguard_client.clear_clients()
+            # Selectively clear: preserve no-MAC clients (e.g. Docker Network) and
+            # any clients that match exclusion rules.
+            for client in self.adguard_client.get_clients():
+                try:
+                    dhcp = client.to_dhcp_client()
+                except ValueError:
+                    # No MAC — always keep.
+                    continue
+                if self._is_excluded(dhcp, exclude_ranges, exclude_ids):
+                    click.secho(
+                        f"Protected from overwrite: '{client.name}'",
+                        fg="yellow",
+                    )
+                    continue
+                self.adguard_client.remove_client_device(client.name)
 
         eero_clients = []
         for client in self.eero_client.get_clients(self.__network):
@@ -131,48 +215,63 @@ class EeroAdGuardSyncHandler:
                 adguard_clients.append(client.to_dhcp_client())
             except ValueError:
                 click.secho(
-                    f"AdGuard device missing MAC address, skipped device named '{client.name}'",
-                    fg="red",
+                    f"AdGuard client '{client.name}' has no MAC address — skipped from sync, will not be modified or deleted.",
+                    fg="yellow",
                 )
         adguard_table = DHCPClientTable(adguard_clients)
 
+        # Pre-build claimed ids from existing adguard clients so new ones don't collide
+        claimed_from_adguard: set[str] = set()
+        for client in adguard_clients:
+            claimed_from_adguard.update(i.lower() for i in client.identifiers)
+
         dhcp_diff = adguard_table.compare(eero_table)
         if not overwrite:
-            self.update(dhcp_diff)
-        self.create(dhcp_diff)
+            self.update(dhcp_diff, conflicting_nicknames=eero_table.conflicting_nicknames)
+        self.create(
+            dhcp_diff,
+            conflicting_nicknames=eero_table.conflicting_nicknames,
+            claimed_ids=claimed_from_adguard,
+        )
         if delete:
-            self.delete(dhcp_diff)
+            self.delete(dhcp_diff, exclude_ranges=exclude_ranges, exclude_ids=exclude_ids)
 
 
 @click.command()
 @click.option(
     "--adguard-host",
+    envvar="EAG_ADGUARD_HOST",
     help="AdGuard Home host IP address",
     type=str,
 )
 @click.option(
     "--adguard-user",
+    envvar="EAG_ADGUARD_USER",
     help="AdGuard Home username",
     type=str,
 )
 @click.option(
     "--adguard-password",
+    envvar="EAG_ADGUARD_PASS",
     help="AdGuard Home password",
     type=str,
 )
 @click.option(
     "--eero-user",
+    envvar="EAG_EERO_USER",
     help="Eero email address or phone number",
     type=str,
 )
 @click.option(
     "--eero-cookie",
+    envvar="EAG_EERO_COOKIE",
     help="Eero session cookie",
     type=str,
 )
 @click.option(
     "--delete",
     "-d",
+    envvar="EAG_DELETE",
     is_flag=True,
     default=False,
     help="Delete AdGuard clients not found in Eero DHCP list",
@@ -180,6 +279,7 @@ class EeroAdGuardSyncHandler:
 @click.option(
     "--confirm",
     "-y",
+    envvar="EAG_CONFIRM",
     is_flag=True,
     default=False,
     help="Skip interactive confirmation",
@@ -187,9 +287,33 @@ class EeroAdGuardSyncHandler:
 @click.option(
     "--overwrite",
     "-o",
+    envvar="EAG_OVERWRITE",
     is_flag=True,
     default=False,
     help="Delete all AdGuard clients before sync",
+)
+@click.option(
+    "--exclude-range",
+    "-x",
+    envvar="EAG_EXCLUDE_RANGE",
+    multiple=True,
+    help=(
+        "CIDR range(s) protected from deletion when --delete is active "
+        "(e.g. 192.168.1.0/24). Repeatable. "
+        "Env var: comma-separated string."
+    ),
+)
+@click.option(
+    "--exclude-id",
+    "-e",
+    envvar="EAG_EXCLUDE_ID",
+    multiple=True,
+    help=(
+        "Client identifier(s) protected from deletion when --delete is active. "
+        "Accepts MAC address, client name, or hostname. Supports wildcards (e.g. my-device*). "
+        "Repeatable. "
+        "Env var: comma-separated string."
+    ),
 )
 @click.option(
     "--debug",
@@ -206,10 +330,22 @@ def sync(
     delete: bool = False,
     confirm: bool = False,
     overwrite: bool = False,
+    exclude_range: tuple[str, ...] = (),
+    exclude_id: tuple[str, ...] = (),
     debug: bool = False,
-    *args,
-    **kwargs,
 ):
+    # Expand comma-separated env var values for multi-options
+    exclude_range = _parse_multi_env(exclude_range)
+    exclude_id = _parse_multi_env(exclude_id)
+
+    # Parse CIDR ranges
+    parsed_ranges: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for r in exclude_range:
+        try:
+            parsed_ranges.append(ipaddress.ip_network(r, strict=False))
+        except ValueError:
+            raise click.BadParameter(f"Invalid CIDR range: '{r}'", param_hint="--exclude-range")
+
     # Eero auth
     eero_client = EeroClient(eero_cookie)
     if eero_client.needs_login():
@@ -245,7 +381,7 @@ def sync(
     if overwrite:
         delete = False
     if not confirm:
-        click.confirm(f"Sync this network?", abort=True)
+        click.confirm("Sync this network?", abort=True)
         if overwrite:
             click.confirm(
                 "WARNING: All clients in AdGuard will be deleted, confirm?", abort=True
@@ -257,6 +393,11 @@ def sync(
             )
     click.echo("Starting sync...")
     start = timer()
-    handler.sync(delete, overwrite)
+    handler.sync(
+        delete=delete,
+        overwrite=overwrite,
+        exclude_ranges=parsed_ranges,
+        exclude_ids=set(exclude_id),
+    )
     elapsed = timer() - start
     click.echo(f"Sync complete in {round(elapsed, 2)}s")
