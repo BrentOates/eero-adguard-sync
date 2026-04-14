@@ -97,15 +97,47 @@ Options:
                           Env var: comma-separated string.  [env: EAG_EXCLUDE_RANGE]
   -e, --exclude-id TEXT   Client identifier(s) protected from deletion when
                           --delete is active. Accepts MAC address, client name,
-                          or hostname. Supports wildcards (e.g. my-device*). Repeatable.
-                          Env var: comma-separated string.  [env: EAG_EXCLUDE_ID]
+                          or hostname. Supports wildcards and regex (re: prefix).
+                          Repeatable. Env var: comma-separated string.  [env: EAG_EXCLUDE_ID]
   --debug                 Display debug information
+  --no-global-id TEXT     Client identifier(s) always registered in AdGuard with
+                          'Use global settings' disabled. Accepts MAC address,
+                          client name, or hostname. Supports wildcards and regex
+                          (re: prefix). Repeatable.
+                          Env var: comma-separated string.  [env: EAG_NO_GLOBAL_ID]
   --help                  Show this message and exit.
+```
+
+#### Per-client AdGuard settings
+
+`--no-global-id` registers specific devices in AdGuard with **"Use global settings" turned off**, letting you configure per-client DNS rules, blocked services, or upstream resolvers for those devices without affecting the rest of the network. Unlike `--exclude-id`, the device is still fully synced (name, IPs, tags) — only `use_global_settings` is pinned to `false`.
+
+Patterns are matched against the client's **nickname** only. Plain patterns use shell-style wildcards (`*`, `?`). Prefix a pattern with `re:` to use a Python regex instead.
+
+```shell
+# Pin by device name
+eag-sync sync --no-global-id "Alice's iPad"
+
+# Pin by MAC address
+eag-sync sync --no-global-id "aa-bb-cc-dd-ee-ff"
+
+# Pin multiple devices
+eag-sync sync --no-global-id "Alice's iPad" --no-global-id "Alice's iPhone"
+
+# Wildcard — all devices whose name starts with a prefix
+eag-sync sync --no-global-id "Alice*"
+
+# Regex — all devices starting with "Alice" except "Alice's HomePod"
+eag-sync sync --no-global-id "re:^Alice(?!.*HomePod)"
+
+# Or via env var (comma-separated)
+# EAG_NO_GLOBAL_ID="Alice's iPad,Alice's iPhone"
+# EAG_NO_GLOBAL_ID="re:^Alice(?!.*HomePod)"
 ```
 
 #### Protecting clients from deletion
 
-When running with `--delete`, you can protect specific clients from being removed even if they are absent from the Eero DHCP list:
+When running with `--delete`, you can protect specific clients from being removed. Both plain wildcards (`*`, `?`) and `re:` prefixed Python regex are supported.
 
 ```shell
 # Protect an entire subnet
@@ -119,6 +151,9 @@ eag-sync sync --delete --exclude-id "My Device"
 
 # Protect all devices whose name starts with a prefix (wildcard)
 eag-sync sync --delete --exclude-id "my-prefix*"
+
+# Regex — protect all devices starting with "Alice" except "Alice's HomePod"
+eag-sync sync --delete --exclude-id "re:^Alice(?!.*HomePod)"
 
 # Combine multiple protections
 eag-sync sync --delete \
@@ -140,6 +175,7 @@ Options:
   -y, --confirm  Skip interactive confirmation
   --help         Show this message and exit.
 ```
+
 
 ## 🔮 Autocompletion
 
@@ -172,6 +208,7 @@ All configuration is passed via environment variables. Every CLI option has a co
 | `EAG_CONFIRM` | Skip interactive confirmation (`true`/`1`) | No | |
 | `EAG_EXCLUDE_RANGE` | Comma-separated CIDR ranges protected from deletion | No | |
 | `EAG_EXCLUDE_ID` | Comma-separated client identifiers (MAC, name, hostname) protected from deletion | No | |
+| `EAG_NO_GLOBAL_ID` | Comma-separated client identifiers always given per-client AdGuard settings (MAC, name, or hostname, wildcards ok) | No | |
 | `EAG_CRON_SCHEDULE` | Sync schedule in cron syntax | No | `0 0 * * *` |
 
 ### Example `docker run`
@@ -205,6 +242,7 @@ services:
       EAG_CONFIRM: "true"
       EAG_EXCLUDE_RANGE: "192.168.1.0/24"
       EAG_EXCLUDE_ID: "11:22:33:44:55:66,my-server"
+      EAG_NO_GLOBAL_ID: "Alice's iPad,Alice's iPhone"
       EAG_CRON_SCHEDULE: "0 * * * *"
     restart: unless-stopped
 ```

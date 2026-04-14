@@ -1,5 +1,6 @@
 import ipaddress
 import fnmatch
+import re
 import click
 from requests import HTTPError
 from timeit import default_timer as timer
@@ -27,6 +28,14 @@ def _parse_multi_env(value: tuple[str, ...]) -> tuple[str, ...]:
     for item in value:
         result.extend(v.strip() for v in item.split(",") if v.strip())
     return tuple(result)
+
+
+def _match_pattern(candidate: str, pattern: str) -> bool:
+    """Match a candidate string against a pattern.
+    Patterns prefixed with 're:' are treated as Python regex; others use fnmatch."""
+    if pattern.startswith("re:"):
+        return bool(re.search(pattern[3:], candidate))
+    return fnmatch.fnmatch(candidate, pattern)
 
 
 class EeroAdGuardSyncHandler:
@@ -71,12 +80,12 @@ class EeroAdGuardSyncHandler:
         patterns = [i.lower() for i in exclude_ids]
         candidates = [
             str(device.mac_address).lower(),
-            device.nickname.lower(),
-            device.hostname.lower(),
+            (device.nickname or "").lower(),
+            (device.hostname or "").lower(),
         ]
         for candidate in candidates:
             for pattern in patterns:
-                if fnmatch.fnmatch(candidate, pattern):
+                if _match_pattern(candidate, pattern):
                     return True
         for iface in device.ip_interfaces:
             for network in exclude_ranges:
@@ -84,23 +93,36 @@ class EeroAdGuardSyncHandler:
                     return True
         return False
 
+    def _is_no_global(self, device: DHCPClient, no_global_ids: set[str]) -> bool:
+        """Return True if the device's nickname matches any --no-global-id pattern."""
+        if not no_global_ids:
+            return False
+        nickname = (device.nickname or "").lower()
+        patterns = [i.lower() for i in no_global_ids]
+        return any(_match_pattern(nickname, p) for p in patterns)
+
     def create(
         self,
         diff: DHCPClientTableDiff,
         conflicting_nicknames: set[str] = None,
         claimed_ids: set[str] = None,
+        no_global_ids: set[str] = None,
     ):
         if not diff.discovered:
             click.echo("No new clients found, skipped creation")
             return
         conflicting_nicknames = {n.lower() for n in (conflicting_nicknames or set())}
         running_claimed = set(claimed_ids or set())
+        no_global_ids = no_global_ids or set()
         with click.progressbar(
             diff.discovered, label="Add new clients", show_pos=True
         ) as bar:
             for eero_device in bar:
+                use_global = not self._is_no_global(eero_device, no_global_ids)
                 device = AdGuardClientDevice.from_dhcp_client(
-                    eero_device, exclude_ids=conflicting_nicknames | running_claimed
+                    eero_device,
+                    exclude_ids=conflicting_nicknames | running_claimed,
+                    use_global_settings=use_global,
                 )
                 running_claimed.update(i.lower() for i in device.ids)
                 try:
@@ -109,6 +131,7 @@ class EeroAdGuardSyncHandler:
                     errors = [
                         "client already exists",
                         "another client uses the same id",
+                        "another client uses the same name",
                     ]
                     if any(error.lower() in e.response.text.lower() for error in errors):
                         click.secho(
@@ -117,19 +140,36 @@ class EeroAdGuardSyncHandler:
                             fg="yellow",
                         )
                     else:
-                        raise
+                        click.secho(
+                            f"Warning: failed to add '{eero_device.nickname}' "
+                            f"[{eero_device.mac_address}]: {e.response.text}",
+                            fg="yellow",
+                        )
 
-    def update(self, diff: DHCPClientTableDiff, conflicting_nicknames: set[str] = None):
+    def update(
+        self,
+        diff: DHCPClientTableDiff,
+        conflicting_nicknames: set[str] = None,
+        no_global_ids: set[str] = None,
+        exclude_ranges: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = None,
+        exclude_ids: set[str] = None,
+    ):
         if not diff.associated:
             click.echo("No existing clients found, skipped update")
             return
         conflicting_nicknames = {n.lower() for n in (conflicting_nicknames or set())}
+        no_global_ids = no_global_ids or set()
+        exclude_ranges = exclude_ranges or []
+        exclude_ids = exclude_ids or set()
         with click.progressbar(
             diff.associated, label="Update existing clients", show_pos=True
         ) as bar:
             for adguard_device, eero_device in bar:
+                if self._is_excluded(eero_device, exclude_ranges, exclude_ids):
+                    continue
+                use_global = not self._is_no_global(eero_device, no_global_ids)
                 new_device = AdGuardClientDevice.from_dhcp_client(
-                    eero_device, exclude_ids=conflicting_nicknames
+                    eero_device, exclude_ids=conflicting_nicknames, use_global_settings=use_global
                 )
                 new_device.params = adguard_device.instance.params
                 try:
@@ -177,9 +217,11 @@ class EeroAdGuardSyncHandler:
         overwrite: bool = False,
         exclude_ranges: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = None,
         exclude_ids: set[str] = None,
+        no_global_ids: set[str] = None,
     ):  
         exclude_ranges = exclude_ranges or []
         exclude_ids = exclude_ids or set()
+        no_global_ids = no_global_ids or set()
 
         if overwrite:
             # Selectively clear: preserve no-MAC clients (e.g. Docker Network) and
@@ -227,11 +269,18 @@ class EeroAdGuardSyncHandler:
 
         dhcp_diff = adguard_table.compare(eero_table)
         if not overwrite:
-            self.update(dhcp_diff, conflicting_nicknames=eero_table.conflicting_nicknames)
+            self.update(
+                dhcp_diff,
+                conflicting_nicknames=eero_table.conflicting_nicknames,
+                no_global_ids=no_global_ids,
+                exclude_ranges=exclude_ranges,
+                exclude_ids=exclude_ids,
+            )
         self.create(
             dhcp_diff,
             conflicting_nicknames=eero_table.conflicting_nicknames,
             claimed_ids=claimed_from_adguard,
+            no_global_ids=no_global_ids,
         )
         if delete:
             self.delete(dhcp_diff, exclude_ranges=exclude_ranges, exclude_ids=exclude_ids)
@@ -321,6 +370,18 @@ class EeroAdGuardSyncHandler:
     default=False,
     help="Display debug information",
 )
+@click.option(
+    "--no-global-id",
+    envvar="EAG_NO_GLOBAL_ID",
+    multiple=True,
+    help=(
+        "Client identifier(s) that are always registered in AdGuard with "
+        "'Use global settings' disabled, regardless of eero profile membership. "
+        "Accepts MAC address, client name, or hostname. Supports wildcards. "
+        "Repeatable. "
+        "Env var: comma-separated string."
+    ),
+)
 def sync(
     adguard_host: str = None,
     adguard_user: str = None,
@@ -333,10 +394,12 @@ def sync(
     exclude_range: tuple[str, ...] = (),
     exclude_id: tuple[str, ...] = (),
     debug: bool = False,
+    no_global_id: tuple[str, ...] = (),
 ):
     # Expand comma-separated env var values for multi-options
     exclude_range = _parse_multi_env(exclude_range)
     exclude_id = _parse_multi_env(exclude_id)
+    no_global_id = _parse_multi_env(no_global_id)
 
     # Parse CIDR ranges
     parsed_ranges: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
@@ -398,6 +461,7 @@ def sync(
         overwrite=overwrite,
         exclude_ranges=parsed_ranges,
         exclude_ids=set(exclude_id),
+        no_global_ids=set(no_global_id) or None,
     )
     elapsed = timer() - start
     click.echo(f"Sync complete in {round(elapsed, 2)}s")

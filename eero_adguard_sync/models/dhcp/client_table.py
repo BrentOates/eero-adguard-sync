@@ -17,6 +17,7 @@ class DHCPClient:
     hostname: str
     instance: object
     tags: list[str] = field(default_factory=list)
+    extra_macs: list[macaddress.MAC] = field(default_factory=list)
 
     @property
     def simplified_nickname(self) -> str:
@@ -25,6 +26,8 @@ class DHCPClient:
     @property
     def identifiers(self) -> set[str]:
         identifiers = {str(self.mac_address)}
+        for mac in self.extra_macs:
+            identifiers.add(str(mac))
         nick_or_host = self.simplified_nickname or self.hostname
         if nick_or_host:
             identifiers.add(nick_or_host)
@@ -48,6 +51,7 @@ class DHCPClientTable:
 
     def __post_init__(self):
         self.clients = self._merge_duplicate_macs(self.clients)
+        self.clients = self._merge_duplicate_nicknames(self.clients)
 
     def _merge_duplicate_macs(self, clients: list[DHCPClient]) -> list[DHCPClient]:
         seen: dict[str, DHCPClient] = {}
@@ -81,6 +85,54 @@ class DHCPClientTable:
                 seen[mac] = client
         return list(seen.values())
 
+    def _merge_duplicate_nicknames(self, clients: list[DHCPClient]) -> list[DHCPClient]:
+        """Merge entries with the same simplified nickname into one client.
+
+        Handles the MAC-randomisation scenario where the same physical device
+        appears twice in eero under a real MAC and a randomised MAC.  All MACs
+        are preserved as identifiers so AdGuard receives them all on one client.
+        """
+        by_nick: dict[str, DHCPClient] = {}
+        no_nick: list[DHCPClient] = []
+        for client in clients:
+            nick = client.simplified_nickname
+            if not nick:
+                no_nick.append(client)
+                continue
+            if nick not in by_nick:
+                by_nick[nick] = client
+            else:
+                existing = by_nick[nick]
+                extra_macs = (
+                    list(existing.extra_macs)
+                    + [client.mac_address]
+                    + list(client.extra_macs)
+                )
+                ip_map = {str(i.ip): i for i in existing.ip_interfaces}
+                for iface in client.ip_interfaces:
+                    ip_map.setdefault(str(iface.ip), iface)
+                nickname = (
+                    client.nickname
+                    if len(client.nickname) > len(existing.nickname)
+                    else existing.nickname
+                )
+                by_nick[nick] = DHCPClient(
+                    mac_address=existing.mac_address,
+                    ip_interfaces=list(ip_map.values()),
+                    nickname=nickname,
+                    hostname=existing.hostname,
+                    instance=existing.instance,
+                    tags=list(set(existing.tags) | set(client.tags)),
+                    extra_macs=extra_macs,
+                )
+                logger.warning(
+                    "Merged duplicate nickname entries: '%s' [%s] + [%s]",
+                    nick,
+                    existing.mac_address,
+                    client.mac_address,
+                )
+        return list(by_nick.values()) + no_nick
+
     @property
     def conflicting_nicknames(self) -> set[str]:
         """Simplified nicknames that appear in more than one client in this table."""
@@ -93,7 +145,12 @@ class DHCPClientTable:
 
     @property
     def hash_table(self) -> dict[str, DHCPClient]:
-        return {str(i.mac_address): i for i in self.clients}
+        result = {}
+        for client in self.clients:
+            result[str(client.mac_address)] = client
+            for mac in client.extra_macs:
+                result[str(mac)] = client
+        return result
 
     @property
     def nickname_table(self) -> dict[str, DHCPClient]:
@@ -111,17 +168,35 @@ class DHCPClientTable:
 
     def __discover(self, table: "DHCPClientTable") -> list[DHCPClient]:
         tbl = self.hash_table
-        return [v for k, v in table.hash_table.items() if k not in tbl]
+        return [
+            c for c in table.clients
+            if str(c.mac_address) not in tbl
+            and not any(str(m) in tbl for m in c.extra_macs)
+        ]
 
     def __associate(
         self, table: "DHCPClientTable"
     ) -> list[tuple[DHCPClient, DHCPClient]]:
         tbl = table.hash_table
-        return [(v, tbl[k]) for k, v in self.hash_table.items() if k in tbl]
+        result = []
+        for client in self.clients:
+            match = tbl.get(str(client.mac_address))
+            if match is None:
+                for mac in client.extra_macs:
+                    match = tbl.get(str(mac))
+                    if match:
+                        break
+            if match is not None:
+                result.append((client, match))
+        return result
 
     def __prune(self, table: "DHCPClientTable") -> list[DHCPClient]:
         tbl = table.hash_table
-        return [v for k, v in self.hash_table.items() if k not in tbl]
+        return [
+            c for c in self.clients
+            if str(c.mac_address) not in tbl
+            and not any(str(m) in tbl for m in c.extra_macs)
+        ]
 
     def compare(self, table: "DHCPClientTable") -> DHCPClientTableDiff:
         # Primary pass: match by MAC address

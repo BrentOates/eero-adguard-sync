@@ -1,11 +1,11 @@
-FROM python:3.13.0a4-alpine3.19 AS build
+FROM python:3.14-alpine AS build
 WORKDIR /usr/src/app
 COPY . .
 
 RUN pip install --upgrade build
 RUN python -m build --sdist --wheel .
 
-FROM python:3.13.0a4-alpine3.19 as dist
+FROM python:3.14-alpine AS dist
 ARG EAG_TAG
 WORKDIR /usr/src/app
 COPY --from=build /usr/src/app/dist .

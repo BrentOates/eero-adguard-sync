@@ -19,7 +19,6 @@ class AdGuardClientDevice(DHCPClientDevice):
     @property
     def update_dict(self) -> dict:
         data = asdict(self)
-        data.pop("use_global_settings")
         data.pop("use_global_blocked_services")
         return data
 
@@ -53,7 +52,10 @@ class AdGuardClientDevice(DHCPClientDevice):
 
     @classmethod
     def from_dhcp_client(
-        cls, dhcp_client: "DHCPClient", exclude_ids: set[str] = None
+        cls,
+        dhcp_client: "DHCPClient",
+        exclude_ids: set[str] = None,
+        use_global_settings: bool = True,
     ) -> "AdGuardClientDevice":
         if isinstance(dhcp_client.instance, cls):
             return dhcp_client.instance
@@ -64,14 +66,24 @@ class AdGuardClientDevice(DHCPClientDevice):
             ids=list(ids),
             name=dhcp_client.nickname,
             tags=dhcp_client.tags,
+            use_global_settings=use_global_settings,
         )
 
     def to_dhcp_client(self) -> DHCPClient:
+        macs = []
+        for identifier in self.ids:
+            try:
+                macs.append(macaddress.MAC(identifier))
+            except ValueError:
+                continue
+        if not macs:
+            raise ValueError("No valid MAC address")
         return DHCPClient(
-            mac_address=self.mac_address,
+            mac_address=macs[0],
             ip_interfaces=self.ip_addresses,
             nickname=self.name,
             hostname=self.hostname,
             instance=self,
             tags=self.tags,
+            extra_macs=macs[1:],
         )
